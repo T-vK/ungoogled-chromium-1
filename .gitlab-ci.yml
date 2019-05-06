@@ -1,0 +1,130 @@
+# Important: Make sure to increase the default timeout of 60 minutes in the (Project!)-Settings -> CI/CD -> General pipelines settings
+# and add the required secret variables: LAUNCHPAD_SSH_PRIVATE_KEY, LAUNCHPAD_GPG_PRIVATE_KEY, DEBEMAIL, DEBFULLNAME
+# (Go to the (Project!)-Settings -> CI / CD -> Variables)
+
+cache:
+  paths:
+  - apt-cache/
+
+stages:
+  - build-1
+  - launchpad-1
+
+build-src-ubuntu_bionic:
+  image: ubuntu:bionic
+  variables:
+    PACKAGE_TYPE: ubuntu_bionic
+  stage: build-1
+  #only:
+    #- tags
+    #- triggers
+  script:
+    - TMP_FILE="$(mktemp)"
+    - ls -la /tmp
+    - echo "test 123" >> "$TMP_FILE"
+    - ls -la "$TMP_FILE"
+    - cat "$TMP_FILE"
+    - apt-get -qq update --yes
+    # Add GPG key from secret variable so that debuild can sign stuff
+    - apt-get -qq -o dir::cache::archives="apt-cache" install --yes gnupg2 > /dev/null
+    - export GPG_TTY=$(tty) # compensate for ioctl error
+    - gpg2 --list-keys
+    - gpg2 -v --batch --import <(echo "$LAUNCHPAD_GPG_PRIVATE_KEY") # --batch to compensate for "sending to agent" error
+    - "export GPG_USER_ID=$(gpg2 --list-keys --with-colons  | awk -F: '/^uid:/ { print $10 }' | head -1)" # quoted to compensate for colon+space issue
+    - 'export DEB_SIGN_KEYID=$(gpg2 --list-secret-keys --keyid-format SHORT | grep "sec " | cut -d "/" -f2 | cut -d " " -f1 | head -1)'
+
+    #- apt-get -qq -o dir::cache::archives="apt-cache" install --yes git > /dev/null
+    #- export COMMIT_TIME=$(git show -s --format=%cD $CI_COMMIT_SHA)
+    #- sed -iE "s/--.*>/ -- $GPG_USER_ID  $COMMIT_TIME/" ./packaging/$PACKAGE_TYPE/changelog.ungoogin
+    
+    - sed -iE "s/--.*>/-- $GPG_USER_ID/" ./packaging/$PACKAGE_TYPE/changelog.ungoogin
+    - cat ./packaging/$PACKAGE_TYPE/changelog.ungoogin | grep "\-\-"
+    #- cat /etc/devscripts.conf
+    
+    - export DEBIAN_FRONTEND=noninteractive # compensate for tzdata installation being interactive
+    - apt-get -qq -o dir::cache::archives="apt-cache" install --yes packaging-dev python3 python ninja-build equivs devscripts > /dev/null
+    - ln -fs /usr/share/zoneinfo/America/New_York /etc/localtime # compensate for tzdata installation being interactive
+    - dpkg-reconfigure --frontend noninteractive tzdata # compensate for tzdata installation being interactive
+    - mkdir -p build/src
+    - ./get_package.py $PACKAGE_TYPE build/src/debian
+    - cd build/src
+    - 'sed -iE "s/^Maintainer:.*$/Maintainer: $GPG_USER_ID/" debian/control'
+    - cat debian/control | grep "Maintainer"
+    # If necessary, change the dependencies in debian/control to accomodate your environment.
+    # If necessary, modify AR, NM, CC, and CXX variables in debian/rules
+    - debian/rules -d get-orig-source 2>&1 | grep -F -v ".......... .........." # Remove download progress spam
+    
+    - echo -en "y\n" | mk-build-deps -i -r debian/control > /dev/null # install any additional packages needed
+    
+    - find / -name "ungoogled-chromium-browser_68.0.3440.106-1~bionic.dsc" || echo
+    - ls -la "/tmp/debsign.YdNsgOa1/" || echo
+    - find / -name "*.dsc" || echo
+    
+    
+    - apt-get -qq -o dir::cache::archives="apt-cache" install --yes tree > /dev/null # install tree for signing hook script
+    - echo "#!/usr/bin/env bash" > /signing-hook-script.sh
+    - echo "(pwd; ls -la; tree /) > $CI_PROJECT_DIR/build/lstree_gitliab_artifact.txt" >> /signing-hook-script.sh
+    - chmod +x /signing-hook-script.sh
+    - 'debuild --signing-hook=/signing-hook-script.sh -i -S 2>&1 | grep -F -v "dpkg-source: warning:" || echo'
+    # - 'debuild -S -sa 2>&1 | grep -F -v "dpkg-source: warning:"' # quoted to compensate for colon+space issue; grepped to remove unnecessary warnings
+    
+    - ls -la /
+    #- cat /lstree_gitliab_artifact.txt || echo
+    #- find / -name "ungoogled-chromium-browser_68.0.3440.106-1~bionic.dsc" || echo
+    #- ls -la "/tmp/debsign.YdNsgOa1/" || echo
+    #- find / -name "*.dsc" || echo
+
+    - ls -la # our built files should be in here
+    
+    - gpg --verbose  --local-user "$GPG_USER_ID" --clearsign --list-options no-show-policy-urls --armor --textmode --output "$CI_PROJECT_DIR/build/" "./signing-hook-script.sh" || echo
+    
+    - gpg --verbose  --local-user "$GPG_USER_ID" --clearsign --list-options no-show-policy-urls --armor --textmode --output "$CI_PROJECT_DIR/build/" "$CI_PROJECT_DIR/build/ungoogled-chromium-browser_*.dsc" || echo
+    
+  artifacts:
+    paths:
+      - ./build/*.*
+
+launchpad-ubuntu_bionic:
+  image: ubuntu:bionic
+  stage: launchpad-1
+  #only:
+    #- tags
+    #- triggers
+  variables:
+    suite: bionic
+  script:
+    - ls -la
+    - cd ./build
+    - exit
+    
+    # Register ssh key from secret variable so that dput won't ask for a password when uploading
+    - apt-get -qq update --yes
+    - apt-get -qq -o dir::cache::archives="apt-cache" install --yes dput openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$LAUNCHPAD_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    
+    # Upload to launchpad
+      # Docs: https://help.launchpad.net/Packaging/PPA/Uploading
+      # Schema copied from the docs: ~<lp_name>/ubuntu/<ppa_name>/<an ubuntu suite>
+    - lp_name="t-vk" # launchpad user name/id
+    - ppa_name="ungoogled_chromium"
+    #- suite="bionic" # ubuntu suite
+    
+    - app_name="ungoogled-chromium"
+    - login_name="tavk"
+    
+    - echo "[$app_name]" > ~/.dput.cf
+    - echo "fqdn = ppa.launchpad.net" >> ~/.dput.cf
+    - echo "method = sftp" >> ~/.dput.cf
+    - echo "incoming = ~$lp_name/ubuntu/$ppa_name/" >> ~/.dput.cf
+    - echo "incoming = ~t-vk/ubuntu/$ppa_name/$suite" >> ~/.dput.cf # TODO: find out what the hell they mean by "<an ubuntu suite>" in the docs
+    - echo "login = login_name" >> ~/.dput.cf
+    - echo "allow_unsigned_uploads = 0" >> ~/.dput.cf
+    
+    - dput $ppa_name "./build/*_source.changes" # TODO: generate this file first
+    
+    #- app_version="1.0"
+    #- dput $ppa_name "./build/${app_name}_${app_version}_source.changes" # TODO: generate this file first
+
